@@ -38,6 +38,7 @@ logger = logging.getLogger("pdf-chart-extractor")
 # -----------------------------------------------------------------------------
 # Small helpers (geometry, PIL safety)
 # -----------------------------------------------------------------------------
+
 def _iou_xyxy(a, b) -> float:
     ax0, ay0, ax1, ay1 = a; bx0, by0, bx1, by1 = b
     ix0, iy0 = max(ax0, bx0), max(ay0, by0); ix1, iy1 = min(ax1, bx1), min(ay1, by1)
@@ -195,6 +196,33 @@ class PDFChartExtractor:
         self.session.mount("http://", adapter)
         self.session.mount("https://", adapter)
 
+    def _layout_sort_and_tag(self, regions: List[Dict]) -> List[Dict]:
+        """
+        Sort regions visually (top->bottom, then left->right) using row buckets,
+        and assign stable layout_order + human-friendly labels.
+        """
+        def key_fn(r: Dict):
+            # be robust if bbox is malformed
+            try:
+                x0, y0, x1, y1 = r["bbox"]
+            except Exception:
+                return (1 << 30, 1 << 30)
+            # bucket by Y to reduce jitter, then X within row
+            return (int(y0 / 64) * 64, x0)
+
+        # keep only items with bbox for ordering, append any weird ones at end
+        with_bbox = [r for r in regions if r.get("bbox")]
+        without_bbox = [r for r in regions if not r.get("bbox")]
+
+        regions_sorted = sorted(with_bbox, key=key_fn) + without_bbox
+
+        for i, r in enumerate(regions_sorted, start=1):
+            r["layout_order"] = i
+            cat = (r.get("category") or "").lower()
+            r["label"] = f"{'Chart' if cat == 'chart' else 'Table'} {i:02d}"
+        return regions_sorted
+
+
     # -------------------- public entrypoints --------------------
     def generate_thumbnails_for_pdf(self, pdf_path: str, stamped_name: str) -> int:
         """Render all pages to thumbnails (<name>_page_###_thumb.png) used by UI."""
@@ -205,6 +233,7 @@ class PDFChartExtractor:
         return page_count
 
     def process_page(self, pdf_path: str, page_number: int) -> Dict[str, Any]:
+        logger.warning("PATCH_MARKER: process_page v2025-08-26C")  # <-- sanity beacon in logs
         t0 = time.time()
         with fitz.open(pdf_path) as doc:
             if not (1 <= page_number <= len(doc)):
@@ -213,39 +242,93 @@ class PDFChartExtractor:
         base = Path(pdf_path).name
         page_image = self._render_page(pdf_path, page_number, base)
 
-        # _detect_regions_upstage already reads page size internally
+        # Detect/Refine -> regions
         regions = self._detect_regions_upstage(pdf_path, page_number, page_image)
-        # Final safety gate: only keep chart/table categories
+
+        # Filter to allowed categories FIRST
         allowed = getattr(self, "allowed_categories", {"chart", "table"})
         regions = [r for r in regions if (r.get("category") or "").lower() in allowed]
 
-        logger.info("After final gate: %d regions (allowed: %s)",
-                    len(regions), ",".join(sorted(allowed)))
-        if self.debug_timing:
-            logger.info("Detected %d refined regions on page %d", len(regions), page_number)
+        # Stable visual order + labels (top→bottom, then left→right using row buckets)
+        regions = self._layout_sort_and_tag(regions)
 
-        tables, debug_raw = [], []
-        with ThreadPoolExecutor(max_workers=self.max_workers) as pool:
-            futs = {
-                pool.submit(self._process_region, page_image, region, page_number, idx): (region, idx)
+        # ----- ORDER TRACE (intended visual order) -----
+        order_trace = " | ".join(
+            [f"{r.get('layout_order', i+1):02d}:{r.get('label','?')}@{tuple(r['bbox'])}"
+            for i, r in enumerate(regions) if r.get('bbox')]
+        )
+        logger.warning("ORDER TRACE: %s", order_trace)
+
+        tables: List[Dict[str, Any]] = []
+        debug_raw: List[Dict[str, Any]] = []
+
+        # Parallelize region processing BUT assemble results in the same visual order
+        pool_size = max(1, min(self.max_workers, len(regions), 8))
+        finish_order_idx: List[int] = []
+
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        with ThreadPoolExecutor(max_workers=pool_size) as pool:
+            fut_by_idx = {
+                idx: pool.submit(self._process_region, page_image, region, page_number, idx)
                 for idx, region in enumerate(regions)
             }
-            for fut in as_completed(futs):
-                region, idx = futs[fut]
+            results_by_idx = {idx: None for idx in fut_by_idx}
+            for fut in as_completed(list(fut_by_idx.values())):
+                idx = next(k for k, v in fut_by_idx.items() if v is fut)
+                finish_order_idx.append(idx)
                 try:
-                    result = fut.result(timeout=self.llm_timeout + 30)
-                    if result:
-                        tables.append(result["table"])
-                        debug_raw.append(result["debug"])
+                    results_by_idx[idx] = fut.result(timeout=self.llm_timeout + 30)
                 except Exception as e:
                     logger.exception("Region %s failed", idx)
-                    tables.append({"page": page_number, "region": idx, "error": str(e)})
+                    results_by_idx[idx] = {
+                        "table": {
+                            "page": page_number,
+                            "region": idx,
+                            "layout_order": regions[idx].get("layout_order", idx + 1),
+                            "label": regions[idx].get("label") or f"Chart {idx+1:02d}",
+                            "data": [],
+                            "row_count": 0, "total_rows": 0, "visible_rows": 0, "hidden_rows": 0,
+                            "truncated": False, "has_more_rows": False, "remaining_rows": 0, "more_rows": 0,
+                            "error": str(e),
+                        },
+                        "debug": {"page": page_number, "region": idx, "error": str(e)},
+                    }
+
+        # Place results strictly in the same order as 'regions'
+        for idx, region in enumerate(regions):
+            res = results_by_idx.get(idx)
+            if not res:
+                continue
+            if "table" in res and isinstance(res["table"], dict):
+                res["table"]["layout_order"] = region.get("layout_order", idx + 1)
+                res["table"]["label"] = region.get("label") or res["table"].get("label") or f"Chart {idx+1:02d}"
+                tables.append(res["table"])
+            else:
+                tables.append({
+                    "page": page_number,
+                    "region": idx,
+                    "layout_order": region.get("layout_order", idx + 1),
+                    "label": region.get("label") or f"Chart {idx+1:02d}",
+                    "data": [],
+                    "row_count": 0, "total_rows": 0, "visible_rows": 0, "hidden_rows": 0,
+                    "truncated": False, "has_more_rows": False, "remaining_rows": 0, "more_rows": 0,
+                })
+            debug_raw.append((res or {}).get("debug", {}))
+
+        # Final safety: sort by layout_order (should already be correct)
+        tables.sort(key=lambda t: t.get("layout_order", 10**9))
+
+        # ----- RESULT TRACE (actual payload order we return) -----
+        result_trace = " | ".join([f"{t.get('layout_order','?'):02d}:{t.get('label','?')}" for t in tables])
+        logger.warning("RESULT TRACE: %s", result_trace)
+
+        # ----- FINISH TRACE (the order workers actually finished) -----
+        logger.info("FINISH TRACE (worker completion order): %s", " -> ".join(str(i) for i in finish_order_idx))
 
         if self.debug_timing:
             logger.info("Page %d processed in %.2fs", page_number, time.time() - t0)
+
         return {"tables": tables, "debug_raw": debug_raw}
-
-
 
     # -------------------- rendering & detection --------------------
     def _render_page(self, pdf_path: str, page_number: int, stamped_name: str) -> np.ndarray:
@@ -584,55 +667,95 @@ class PDFChartExtractor:
     def _process_region(self, page_image: np.ndarray, region: Dict, page_number: int, region_idx: int) -> Optional[Dict]:
         t0 = time.time()
         try:
+            allowed = getattr(self, "allowed_categories", {"chart", "table"})
+            if (region.get("category") or "").lower() not in allowed:
+                return None
+
+            lo = int(region.get("layout_order", region_idx + 1))
+            cat = (region.get("category") or "chart").lower()
+            label = region.get("label") or (f"Chart {lo:02d}" if cat == "chart" else f"Table {lo:02d}")
+            label_fs = label.replace(" ", "_")
+
             crops = self._generate_crops(page_image, region, page_number, region_idx)
             if not crops or "main" not in crops:
                 raise RuntimeError("No usable crop produced")
 
             extraction_result = self._extract_with_llm(crops, page_number, region_idx)
+            rows = (extraction_result or {}).get("data", []) or []
 
-            if extraction_result and extraction_result.get("data"):
-                table_entry = {
-                    "page": page_number,
-                    "region": region_idx,
-                    "image": crops["main"]["filename"],
-                    "data": extraction_result.get("data", []),
-                    "series_meta": extraction_result.get("series_meta", []),
-                    "chart_type": extraction_result.get("chart_type", "unknown"),
-                    "confidence": extraction_result.get("confidence", "low"),
-                    "note": extraction_result.get("note", ""),
-                    "category": (region.get("category") or "unknown"),
-                    "series_hints": extraction_result.get("series_hints", []),
-                    "extras_used": list(crops.keys()),
-                }
-                debug_entry = {
-                    "page": page_number,
-                    "region": region_idx,
-                    "image": crops["main"]["filename"],
-                    "extras": [crops[k]["filename"] for k in crops if k != "main"],
-                    "raw": extraction_result.get("raw_response", "")[:500],
-                    "raw_fix": extraction_result.get("retry_response", "")[:500],
-                }
-                if self.debug_timing:
-                    logger.info("Region %d processed in %.2fs", region_idx, time.time() - t0)
-                return {"table": table_entry, "debug": debug_entry}
+            # Persist full data (optional)
+            csv_path = None
+            json_path = None
+            try:
+                if rows:
+                    df = pd.DataFrame(rows)
+                    csv_name = f"page_{page_number:03d}_{label_fs}_{lo:02d}_data.csv"
+                    json_name = f"page_{page_number:03d}_{label_fs}_{lo:02d}_data.json"
+                    csv_path = self.dirs["enhanced"] / csv_name
+                    json_path = self.dirs["enhanced"] / json_name
+                    df.to_csv(csv_path, index=False)
+                    with open(json_path, "w", encoding="utf-8") as f:
+                        json.dump(rows, f, ensure_ascii=False)
+            except Exception as _e:
+                logger.warning("Failed to persist full data for %s: %s", label, _e)
 
-            # If LLM returns no data, still show the crop
-            return {
-                "table": {
-                    "page": page_number,
-                    "region": region_idx,
-                    "image": crops["main"]["filename"],
-                    "data": [],
-                    "note": "LLM extraction returned no data",
-                },
-                "debug": {"page": page_number, "region": region_idx, "raw": ""},
+            n = len(rows)
+            table_entry = {
+                "page": page_number,
+                "region": region_idx,
+                "layout_order": lo,
+                "label": label,
+                "image": crops["main"]["filename"],
+                "category": (region.get("category") or "unknown"),
+
+                # FULL dataset — no slicing
+                "data": rows,
+
+                # Be explicit to suppress any “… more rows” UI hint
+                "row_count": n, "total_rows": n, "visible_rows": n, "hidden_rows": 0,
+                "truncated": False, "has_more_rows": False,
+                "remaining_rows": 0, "more_rows": 0, "preview_count": n, "ui_has_more_rows": False,
+
+                # chart metadata
+                "chart_type": (extraction_result or {}).get("chart_type", "unknown"),
+                "confidence": (extraction_result or {}).get("confidence", "low"),
+                "note": (extraction_result or {}).get("note", ""),
+                "series_meta": (extraction_result or {}).get("series_meta", []),
+                "series_hints": (extraction_result or {}).get("series_hints", []),
+                "extras_used": list(crops.keys()),
             }
+            if csv_path: table_entry["data_csv"] = str(csv_path)
+            if json_path: table_entry["data_json"] = str(json_path)
+
+            debug_entry = {
+                "page": page_number,
+                "region": region_idx,
+                "layout_order": lo,
+                "label": label,
+                "image": crops["main"]["filename"],
+                "extras": [crops[k]["filename"] for k in crops if k != "main"],
+                "raw": (extraction_result or {}).get("raw_response", "")[:500],
+                "raw_fix": (extraction_result or {}).get("retry_response", "")[:500],
+            }
+
+            if self.debug_timing:
+                logger.info("%s rows=%d processed in %.2fs", label, n, time.time() - t0)
+
+            return {"table": table_entry, "debug": debug_entry}
+
         except Exception as e:
-            logger.exception("Error processing region %s", region_idx)
+            logger.exception("Error processing %s (region %s)", region.get("label") or f"Region {region_idx}", region_idx)
             return {
                 "table": {
-                    "page": page_number, "region": region_idx,
-                    "error": str(e), "note": f"Processing failed: {e}",
+                    "page": page_number,
+                    "region": region_idx,
+                    "layout_order": int(region.get("layout_order", region_idx + 1)),
+                    "label": region.get("label") or f"Chart {int(region.get('layout_order', region_idx + 1)):02d}",
+                    "error": str(e),
+                    "data": [],
+                    "row_count": 0, "total_rows": 0, "visible_rows": 0, "hidden_rows": 0,
+                    "truncated": False, "has_more_rows": False,
+                    "remaining_rows": 0, "more_rows": 0, "preview_count": 0, "ui_has_more_rows": False,
                 },
                 "debug": {"page": page_number, "region": region_idx, "error": str(e)},
             }
@@ -671,25 +794,34 @@ class PDFChartExtractor:
             new_h = max(1, int(main_img.shape[0] * self.fast_dev_scale))
             main_img = cv2.resize(main_img, (new_w, new_h), interpolation=cv2.INTER_AREA)
 
-        # Save main
-        main_filename = f"page_{page_number}_region_{region_idx}_{timestamp}_crop.png"
+        # Save main (use layout order & label if available)
+        lo = int(region.get("layout_order", region_idx + 1))
+        lbl = (region.get("label") or f"Region {lo}").replace(" ", "_")
+        main_filename = f"page_{page_number:03d}_{lbl}_{lo:02d}_crop.png"
         main_path = self.dirs["enhanced"] / main_filename
         _pil_save_safe(_safe_pil_from_numpy_rgb(main_img), main_path)
         crops["main"] = {"path": main_path, "filename": main_filename, "image": main_img}
 
-        # Optional axis strips
+
+        # Optional axis strips (use layout order + label in names)
+        lo = int(region.get("layout_order", region_idx + 1))
+        lbl = (region.get("label") or f"Region {lo}").replace(" ", "_")
+
         if main_img.shape[1] > 240:
+            # left strip
             left_strip = main_img[:, :120]
-            lf = f"page_{page_number}_region_{region_idx}_{timestamp}_axisL.png"
+            lf = f"page_{page_number:03d}_{lbl}_{lo:02d}_axisL.png"
             lp = self.dirs["enhanced"] / lf
             _pil_save_safe(_safe_pil_from_numpy_rgb(left_strip), lp)
             crops["axis_left"] = {"path": lp, "filename": lf, "image": left_strip}
 
+            # right strip
             right_strip = main_img[:, -120:]
-            rf = f"page_{page_number}_region_{region_idx}_{timestamp}_axisR.png"
+            rf = f"page_{page_number:03d}_{lbl}_{lo:02d}_axisR.png"
             rp = self.dirs["enhanced"] / rf
             _pil_save_safe(_safe_pil_from_numpy_rgb(right_strip), rp)
             crops["axis_right"] = {"path": rp, "filename": rf, "image": right_strip}
+
 
         # Plot-focus (guarded; only when we detect a rectangular plot)
         plot_box = self._find_plot_box_safe(main_img)

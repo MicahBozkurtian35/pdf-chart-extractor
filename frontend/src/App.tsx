@@ -29,6 +29,22 @@ interface TableData {
   series_hints?: string[]
   extras_used?: string[]
   error?: string
+
+  // New optional fields coming from backend:
+  layout_order?: number
+  label?: string
+
+  // Backend flags to indicate full data is present (no truncation):
+  truncated?: boolean
+  has_more_rows?: boolean
+  row_count?: number
+  total_rows?: number
+  visible_rows?: number
+  hidden_rows?: number
+  remaining_rows?: number
+  more_rows?: number
+  preview_count?: number
+  ui_has_more_rows?: boolean
 }
 
 interface ProcessResponse {
@@ -147,9 +163,34 @@ function App() {
       )
     }
 
-    const hasData = table.data && table.data.length > 0
-    const previewData = hasData ? table.data : [];
-    const columns = hasData ? ['X', ...Object.keys(table.data[0]).filter(c => c !== 'X')]: [];
+    const hasData = !!table.data && table.data.length > 0
+
+    // ---- PREVIEW CONTROL ----
+    // Keep as `null` to show ALL rows and NO "more rows" hint.
+    // If you ever want a capped preview, set this to a number (e.g., 50).
+    const previewLimit: number | null = null
+
+    const columns = hasData
+      ? ['X', ...Object.keys(table.data[0]).filter(c => c !== 'X')]
+      : []
+
+    const isPreviewing =
+      previewLimit !== null &&
+      hasData &&
+      table.data.length > previewLimit
+
+    const previewData = hasData
+      ? (isPreviewing ? table.data.slice(0, previewLimit) : table.data)
+      : []
+
+    // Backend-supplied “no truncation” flags (present in your new backend)
+    const backendSaysNoMore =
+      table.truncated === false &&
+      table.has_more_rows === false &&
+      (table.remaining_rows ?? 0) === 0 &&
+      (table.more_rows ?? 0) === 0
+
+    const showMoreRowsMsg = isPreviewing && !backendSaysNoMore
 
     return (
       <div className="region-card" key={`${table.page}-${table.region}`}>
@@ -163,7 +204,15 @@ function App() {
         )}
         
         <div className="region-info">
-          <h3>Region {table.region}</h3>
+          <h3>
+            Region {table.region}
+            {typeof table.layout_order === 'number' && (
+              <span className="chip" style={{ marginLeft: 8 }}>Order {table.layout_order}</span>
+            )}
+            {table.label && (
+              <span className="chip" style={{ marginLeft: 8 }}>{table.label}</span>
+            )}
+          </h3>
           
           <div className="metadata">
             {table.chart_type && (
@@ -195,7 +244,7 @@ function App() {
                       {columns.map(col => (
                         <td key={col}>
                           {typeof row[col] === 'number' 
-                            ? row[col].toFixed(2) 
+                            ? (Number.isFinite(row[col]) ? row[col].toFixed(2) : row[col])
                             : row[col]}
                         </td>
                       ))}
@@ -203,9 +252,10 @@ function App() {
                   ))}
                 </tbody>
               </table>
-              {table.data.length > 5 && (
+
+              {showMoreRowsMsg && previewLimit !== null && (
                 <div className="more-rows">
-                  ... and {table.data.length - 5} more rows
+                  … and {table.data.length - previewLimit} more rows
                 </div>
               )}
             </div>
@@ -316,7 +366,9 @@ function App() {
             </div>
             
             <div className="regions-grid">
-              {tables.map(renderTable)}
+              {[...tables]
+                .sort((a, b) => (a.layout_order ?? 1) - (b.layout_order ?? 1))
+                .map(renderTable)}
             </div>
           </section>
         )}

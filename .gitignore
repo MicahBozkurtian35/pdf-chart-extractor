@@ -1,24 +1,3 @@
-﻿# Python
-__pycache__/
-*.pyc
-.venv/
-
-# Node/React
-node_modules/
-dist/
-
-# Docker
-*.log
-*.pid
-*.sock
-
-# Project specific
-backend/uploads/
-backend/debug/
-backend/temp_images/
-backend/enhanced_images/
-backend/thumbnails/
-backend/upstage_cache/
-backend/llm_cache/
-.env
-.env.*
+**/.env
+**/.env.*
+!**/.env.example
