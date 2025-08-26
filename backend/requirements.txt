@@ -1,0 +1,12 @@
+Flask==3.0.3
+flask-cors==4.0.1
+python-dotenv==1.0.1
+requests==2.32.3
+pymupdf==1.24.9
+pdf2image==1.17.0
+Pillow==10.4.0
+numpy==1.26.4
+opencv-python==4.10.0.84
+pandas==2.2.2
+python-json-logger==2.0.7
+pytest==8.3.2
